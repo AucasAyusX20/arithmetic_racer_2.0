@@ -13,13 +13,16 @@ pygame.display.set_caption("Arithmetic Racer 2.0 - Wide Forest")
 clock = pygame.time.Clock()
 
 # --- COLORS ---
-SKY_TOP = (20, 5, 25)         
-SKY_BOTTOM = (60, 10, 50)     
-SUN_COLOR = (255, 100, 0)     
+SKY_TOP = (20, 5, 25)
+SKY_BOTTOM = (60, 10, 50)
 GRID_COLOR = (0, 255, 255)    
 HORIZON_LINE = (255, 0, 128)  
 ROAD_GREY = (15, 15, 20)      
 ROAD_LINE_WHITE = (255, 255, 255)
+
+# Gradient Sun
+SUN_TOP_COLOR = (255, 255, 0)   # bright yellow crown
+SUN_BASE_COLOR = (255, 0, 128)  # deep neon pink at the horizon
 
 # Tree Colors
 TRUNK_COLOR = (20, 10, 15)
@@ -34,6 +37,10 @@ PLAYER_Y = HEIGHT - 100
 ROAD_WIDTH_TOP = 150              
 ROAD_WIDTH_BOTTOM = 800  
 
+# --- SUN GEOMETRY ---
+SUN_RADIUS = 100      # disc radius, unchanged from the original sun
+SUN_HALO_PAD = 20     # margin kept above the disc for the outer glow ring
+
 # --- LOAD THE BIKE IMAGE ---
 try:
     BIKE_IMG = pygame.image.load("bike.png").convert_alpha()
@@ -46,8 +53,9 @@ class PygameRacer:
     def __init__(self):
         self.state = None
         self.app_state = "START"
-        self.name_input = "AYUSH"
+        self.name_input = ""
         self.scroll_offset = 0.0
+        self.sun_canvas = None
         
         self.stars = [{"x": random.randint(0, WIDTH), "y": random.randint(0, HORIZON_Y - 100), 
                         "scale": random.uniform(0.5, 1.5)} for _ in range(60)]
@@ -57,7 +65,15 @@ class PygameRacer:
         while x < WIDTH:
             w = random.randint(20, 50)
             h = random.randint(10, 80)
-            self.skyline.append((x, w, h))
+            
+            # Pre-generate windows so they don't flicker every frame
+            windows = []
+            for wx in range(x + 5, x + w - 5, 8):
+                for wy in range(HORIZON_Y - h + 5, HORIZON_Y - 5, 10):
+                    if random.random() > 0.7:
+                        windows.append((wx, wy, random.choice([(0, 255, 255), (255, 0, 128), (255, 255, 0)])))
+            
+            self.skyline.append({"x": x, "w": w, "h": h, "windows": windows})
             x += w
 
         self.trees = []
@@ -79,6 +95,19 @@ class PygameRacer:
             "scale": random.uniform(0.8, 1.4), # Tighter scale range
             "color": color
         }
+
+    # --- VISUAL HELPERS (rendering only — no game logic touched) ---
+
+    def lerp_color(self, c1, c2, t):
+        """Blend two RGB colors: t = 0 returns c1, t = 1 returns c2."""
+        return tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
+
+    def neon_line(self, color, start, end, width=4):
+        """Draw a line with a cheap layered neon glow: wide dim halo layers
+        stack down to a bright, crisp core (no per-frame alpha surfaces)."""
+        for grow, glow in ((14, 0.16), (9, 0.32), (5, 0.55), (0, 1.0)):
+            faded = tuple(int(c * glow) for c in color)
+            pygame.draw.line(screen, faded, start, end, max(1, width + grow))
 
     def start_game(self):
         self.state = GameState(self.name_input)
@@ -131,21 +160,86 @@ class PygameRacer:
         for s in self.stars:
             pygame.draw.circle(screen, (255, 255, 255), (int(s["x"]), int(s["y"])), max(1, int(s["scale"])))
 
-        for (x, w, h) in self.skyline:
-            pygame.draw.rect(screen, (10, 5, 15), (x, HORIZON_Y - h, w, h))
-            for wx in range(x + 5, x + w - 5, 8):
-                for wy in range(HORIZON_Y - h + 5, HORIZON_Y - 5, 10):
-                    if random.random() > 0.7:
-                        pygame.draw.rect(screen, (255, 200, 0), (wx, wy, 2, 2))
+        for b in self.skyline:
+            # Draw the building base
+            pygame.draw.rect(screen, (15, 10, 25), (b["x"], HORIZON_Y - b["h"], b["w"], b["h"]))
+            # Draw the neon outline
+            pygame.draw.rect(screen, (255, 0, 128), (b["x"], HORIZON_Y - b["h"], b["w"], b["h"]), 1)
+            # Draw the pre-generated windows
+            for wx, wy, color in b["windows"]:
+                pygame.draw.rect(screen, color, (wx, wy, 4, 6))
 
-        sun_radius = 100
-        pygame.draw.circle(screen, SUN_COLOR, (WIDTH//2, HORIZON_Y), sun_radius)
-        for i in range(6):
-            stripe_y = HORIZON_Y - sun_radius + (i * 20)
-            if stripe_y < HORIZON_Y:
-                pygame.draw.rect(screen, SKY_BOTTOM, (WIDTH//2 - sun_radius, stripe_y, sun_radius*2, 8))
+        # --- SYNTHWAVE GRADIENT SUN ---
+        # The sun sprite never changes frame-to-frame, so its scanline loops
+        # run exactly once in build_sun_canvas(); every frame we just blit it.
+        if self.sun_canvas is None:
+            self.sun_canvas = self.build_sun_canvas()
+        sun_x = WIDTH//2 - SUN_RADIUS - SUN_HALO_PAD
+        sun_y = HORIZON_Y - SUN_RADIUS - SUN_HALO_PAD
+        screen.blit(self.sun_canvas, (sun_x, sun_y))
 
         pygame.draw.line(screen, HORIZON_LINE, (0, HORIZON_Y), (WIDTH, HORIZON_Y), 4)
+
+    def build_sun_canvas(self):
+        """Renders the gradient sun once into a reusable canvas:
+        1) scanline gradient fill — bright yellow crown fading to deep
+           neon pink at the horizon, clipped to the disc's curve,
+        2) retro SKY_BOTTOM stripe cutouts, per-scanline so they end crisply
+           on the sun's silhouette,
+        3) a subtle glowing rim, stroked in vertical bands (yellow to pink)
+           with per-pixel alpha halos fading into a crisp core edge."""
+        sun_radius = SUN_RADIUS
+        pad = SUN_HALO_PAD
+        canvas_w = (sun_radius + pad) * 2
+        canvas_h = sun_radius + pad + 2
+        canvas = pygame.Surface((canvas_w, canvas_h), pygame.SRCALPHA)
+        cx = canvas_w // 2
+        base_y = pad + sun_radius   # circle center maps to the horizon row
+        sun_top = base_y - sun_radius
+
+        # 1) Scanline gradient fill: one horizontal line per row.
+        for y in range(sun_top, base_y + 1):
+            t = (y - sun_top) / sun_radius
+            color = self.lerp_color(SUN_TOP_COLOR, SUN_BASE_COLOR, t)
+            dy = base_y - y
+            half_w = int((sun_radius * sun_radius - dy * dy) ** 0.5 + 0.5)
+            if half_w > 0:
+                pygame.draw.line(canvas, color, (cx - half_w, y), (cx + half_w, y))
+
+        # 2) Retro stripe cutouts. Each row is clipped to the disc as it is
+        #    drawn, so the stripes end cleanly on the silhouette. The first
+        #    stripe starts below the crown to keep the yellow cap solid.
+        stripe_h = 7
+        for i in range(6):
+            stripe_y = sun_top + 14 + (i * 18)
+            if stripe_y >= base_y: break
+            for y in range(stripe_y, min(stripe_y + stripe_h, base_y)):
+                dy = base_y - y
+                half_w = int((sun_radius * sun_radius - dy * dy) ** 0.5 + 0.5)
+                if half_w > 0:
+                    pygame.draw.line(canvas, SKY_BOTTOM, (cx - half_w, y), (cx + half_w, y))
+
+        # 3) Subtle glowing outline. Rings are written with per-pixel alpha
+        #    (wide, faint halo down to a crisp colored core) so the cached
+        #    canvas glows softly over the sky and skyline when blitted.
+        rim_layers = ((18, 4, 12), (15, 3, 18), (12, 3, 26), (9, 3, 36),
+                      (6, 3, 52), (4, 3, 76), (2, 2, 120), (1, 2, 255))
+        bands = 24
+        step = (sun_radius + pad) / float(bands)
+        for b in range(bands):
+            top = int(sun_top - pad + b * step)
+            bottom = int(top + step + 2)
+            if bottom <= top: continue
+            band_h = bottom - top
+            y_mid = top + band_h * 0.5
+            t_mid = max(0.0, min(1.0, (y_mid - sun_top) / float(sun_radius)))
+            rim_color = self.lerp_color(SUN_TOP_COLOR, SUN_BASE_COLOR, t_mid)
+            canvas.set_clip((0, top, canvas_w, band_h))
+            for grow, width, alpha in rim_layers:
+                pygame.draw.circle(canvas, (*rim_color, alpha), (cx, base_y), sun_radius + grow, width)
+            canvas.set_clip(None)
+        return canvas.convert_alpha()
+
 
     def draw_grid(self):
         pygame.draw.rect(screen, (10, 10, 15), (0, HORIZON_Y, WIDTH, HEIGHT - HORIZON_Y))
@@ -183,45 +277,57 @@ class PygameRacer:
         ]
         pygame.draw.polygon(screen, ROAD_GREY, road_points)
 
-        pygame.draw.line(screen, GRID_COLOR, road_points[0], road_points[3], 5)
-        pygame.draw.line(screen, GRID_COLOR, road_points[1], road_points[2], 5)
-        pygame.draw.line(screen, HORIZON_LINE, (WIDTH//2, HORIZON_Y), (WIDTH//2, HEIGHT), 5)
+        # Thick glowing cyan shoulders + neon pink center line.
+        self.neon_line(GRID_COLOR, road_points[0], road_points[3], 6)
+        self.neon_line(GRID_COLOR, road_points[1], road_points[2], 6)
+        self.neon_line(HORIZON_LINE, (WIDTH//2, HORIZON_Y), (WIDTH//2, HEIGHT), 6)
 
-        for z in range(20):
-            depth = ((z * 0.3) - (self.scroll_offset % 10000) / 1000.0)
+        # Dashed white lane dividers at 1/3 and 2/3 of the road width.
+        # z*0.15 spans the whole scroll period (the old range(20) only
+        # reached 5.7, so the dashes blinked out of existence every cycle).
+        for z in range(76):
+            depth = ((z * 0.15) - (self.scroll_offset % 10000) / 1000.0)
             if 0 < depth < 1.0:
-                p = depth ** 2.5 
+                p = depth ** 2.5
+                # Measure the dash in depth space so the on-screen dash/gap
+                # rhythm stays consistent instead of stretching near the bike.
+                p_end = min(1.0, depth + 0.075) ** 2.5
                 y1 = HORIZON_Y + p * (HEIGHT - HORIZON_Y)
-                y2 = HORIZON_Y + (p + 0.04) * (HEIGHT - HORIZON_Y)
-                
+                y2 = HORIZON_Y + p_end * (HEIGHT - HORIZON_Y)
+
                 if y1 < HEIGHT:
-                    width = max(1, int(p * 10))
-                    for i in [1, 2]:
+                    width = max(4, int(4 + p * 10))
+                    for i in (1, 2):
                         top_x = (WIDTH//2 - ROAD_WIDTH_TOP//2) + (ROAD_WIDTH_TOP * (i/3))
                         bot_x = (WIDTH//2 - ROAD_WIDTH_BOTTOM//2) + (ROAD_WIDTH_BOTTOM * (i/3))
-                        current_x = top_x + p * (bot_x - top_x)
-                        pygame.draw.line(screen, ROAD_LINE_WHITE, (current_x, y1), (current_x, y2), width)
+                        x1 = top_x + p * (bot_x - top_x)
+                        x2 = top_x + p_end * (bot_x - top_x)
+                        pygame.draw.line(screen, ROAD_LINE_WHITE, (x1, y1), (x2, y2), width)
 
     def draw_forest(self):
         sorted_trees = sorted(self.trees, key=lambda t: t["z"])
-        
+
         for t in sorted_trees:
             p = t["z"] ** 2.5
-            
-            current_road_width = ROAD_WIDTH_TOP + p * (ROAD_WIDTH_BOTTOM - ROAD_WIDTH_TOP)
-            road_edge = WIDTH//2 + t["side"] * (current_road_width // 2)
-            
-            space_available = (WIDTH//2) - (current_road_width // 2)
-            offset = t["x_offset"] * space_available
-            tx = road_edge + t["side"] * offset
-            
-            # --- LOWERED TREES ---
-            # Reduced max height from 500 to 220, and width from 150 to 70
-            th = 220 * p * t["scale"] 
-            tw = 70 * p * t["scale"]  
-            
+
+            # Size is computed first so placement can use the canopy width.
+            th = 220 * p * t["scale"]
+            tw = 70 * p * t["scale"]
             if th < 3: continue
-            
+
+            current_road_width = ROAD_WIDTH_TOP + p * (ROAD_WIDTH_BOTTOM - ROAD_WIDTH_TOP)
+            half_road = current_road_width * 0.5
+            road_edge = WIDTH * 0.5 + t["side"] * half_road
+            space_available = WIDTH * 0.5 - half_road
+
+            # Reserve a clear shoulder between the glowing road border and
+            # the nearest canopy, then distribute the tree in the space left.
+            tree_half = tw * 0.5
+            shoulder = 12 + p * 30
+            setback = tree_half + shoulder
+            spread = max(0.0, space_available - setback - tree_half - 4)
+            tx = road_edge + t["side"] * (setback + t["x_offset"] * spread)
+
             ty = HORIZON_Y + p * (HEIGHT - HORIZON_Y)
             
             trunk_rect = pygame.Rect(tx - tw*0.15, ty - th*0.2, tw*0.3, th*0.2)
@@ -237,7 +343,13 @@ class PygameRacer:
                     (tx - layer_w/2, layer_y), 
                     (tx + layer_w/2, layer_y)  
                 ]
-                pygame.draw.polygon(screen, t["color"], points)
+                # Shading gradient for a 3D look:
+                # i == 0 (bottom layer): darken by 30
+                # i == 1 (middle layer): base color
+                # i == 2 (top layer): brighten by 30
+                shade = -30 if i == 0 else (30 if i == 2 else 0)
+                shaded_color = tuple(max(0, min(255, c + shade)) for c in t["color"])
+                pygame.draw.polygon(screen, shaded_color, points)
 
     def draw_player(self):
         lane_width_bottom = ROAD_WIDTH_BOTTOM / 3
